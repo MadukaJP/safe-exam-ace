@@ -37,6 +37,7 @@ export default function ActiveQuiz({ webcamStream, micStream, screenStream, refe
   const [audioLevel, setAudioLevel] = useState(0);
   const [audioClips, setAudioClips] = useState<AudioClip[]>([]);
   const [fullscreenBlocked, setFullscreenBlocked] = useState(false);
+  const [multiMonitorBlocked, setMultiMonitorBlocked] = useState(false);
   const [showSubmitDialog, setShowSubmitDialog] = useState(false);
 
   const webcamRef = useRef(webcamStream);
@@ -136,9 +137,17 @@ export default function ActiveQuiz({ webcamStream, micStream, screenStream, refe
       }
     };
 
-    if ((window.screen as any).isExtended) {
-      addViolation('MULTIPLE_MONITORS', { detail: 'Extended display detected' });
-    }
+    // Multiple monitor detection with blocking
+    const checkMonitors = () => {
+      if ((window.screen as any).isExtended) {
+        setMultiMonitorBlocked(true);
+        addViolation('MULTIPLE_MONITORS', { detail: 'Extended display detected' });
+      } else {
+        setMultiMonitorBlocked(false);
+      }
+    };
+    checkMonitors();
+    const monitorInterval = setInterval(checkMonitors, 3000);
 
     const devtools = setInterval(() => {
       if (window.outerWidth - window.innerWidth > 160 || window.outerHeight - window.innerHeight > 160)
@@ -167,13 +176,16 @@ export default function ActiveQuiz({ webcamStream, micStream, screenStream, refe
       document.removeEventListener('fullscreenchange', onFs);
       track?.removeEventListener('ended', onEnded);
       clearInterval(devtools);
+      clearInterval(monitorInterval);
     };
   }, [addViolation, logCapture]);
 
+  // Audio monitoring — only trigger after 3+ seconds of sustained speech
   useEffect(() => {
     let animFrame: number;
     let recorder: MediaRecorder | null = null;
-    let voiceFrames = 0;
+    let voiceStartTime: number | null = null; // when sustained voice started
+    let violated = false; // whether we already fired for this speech segment
 
     try {
       const ctx = new AudioContext();
@@ -182,6 +194,19 @@ export default function ActiveQuiz({ webcamStream, micStream, screenStream, refe
       analyser.fftSize = 512;
       source.connect(analyser);
       const buf = new Uint8Array(analyser.frequencyBinCount);
+
+      // Start a pre-recording buffer so we capture from the start of speech
+      let preRecorder: MediaRecorder | null = null;
+      let preChunks: BlobPart[] = [];
+      const startPreRecording = () => {
+        try {
+          preChunks = [];
+          preRecorder = new MediaRecorder(micRef.current, { mimeType: 'audio/webm' });
+          preRecorder.ondataavailable = e => { if (e.data.size > 0) preChunks.push(e.data); };
+          preRecorder.start(500); // collect in 500ms chunks
+        } catch { preRecorder = null; }
+      };
+      startPreRecording();
 
       const check = () => {
         analyser.getByteFrequencyData(buf);
@@ -193,13 +218,24 @@ export default function ActiveQuiz({ webcamStream, micStream, screenStream, refe
         const avg = sum / (high - low);
         setAudioLevel(avg);
 
+        const now = Date.now();
+
         if (avg > 56) {
-          voiceFrames++;
-          if (voiceFrames >= 5) {
-            addViolation('AUDIO_DETECTED', { detail: `Avg level: ${avg.toFixed(0)}` });
+          if (!voiceStartTime) voiceStartTime = now;
+
+          // 3 seconds of sustained audio → violation + start recording
+          if (!violated && now - voiceStartTime >= 3000) {
+            violated = true;
+            addViolation('AUDIO_DETECTED', { detail: `Sustained speech detected (${((now - voiceStartTime) / 1000).toFixed(1)}s)` });
+
+            // Stop pre-recorder, start a proper recording that includes the buffered data
+            if (preRecorder && preRecorder.state !== 'inactive') {
+              preRecorder.stop();
+            }
+
             if (!recorder || recorder.state === 'inactive') {
               try {
-                const chunks: BlobPart[] = [];
+                const chunks: BlobPart[] = [...preChunks];
                 recorder = new MediaRecorder(micRef.current, { mimeType: 'audio/webm' });
                 recorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
                 recorder.onstop = () => {
@@ -213,13 +249,20 @@ export default function ActiveQuiz({ webcamStream, micStream, screenStream, refe
                   reader.readAsDataURL(blob);
                 };
                 recorder.start();
-                setTimeout(() => { recorder?.stop(); }, 8000);
+                setTimeout(() => { recorder?.stop(); recorder = null; }, 10000);
               } catch { }
             }
-            voiceFrames = 0;
           }
         } else {
-          voiceFrames = Math.max(0, voiceFrames - 1);
+          // Reset when audio drops — give 500ms grace before resetting
+          if (voiceStartTime && now - voiceStartTime > 500) {
+            voiceStartTime = null;
+            violated = false;
+            // Restart pre-recording for next potential speech
+            if (!preRecorder || preRecorder.state === 'inactive') {
+              startPreRecording();
+            }
+          }
         }
         animFrame = requestAnimationFrame(check);
       };
@@ -228,6 +271,7 @@ export default function ActiveQuiz({ webcamStream, micStream, screenStream, refe
       return () => {
         cancelAnimationFrame(animFrame);
         recorder?.stop();
+        preRecorder?.stop();
         ctx.close();
       };
     } catch { }
@@ -256,7 +300,9 @@ export default function ActiveQuiz({ webcamStream, micStream, screenStream, refe
           const count = res.detections.length;
           if (count === 0) {
             multiCount = 0; mismatchCount = 0; missCount++;
-            if (missCount >= 3) { setFaceStatus('none'); addViolation('NO_FACE'); }
+            // Require 5 consecutive misses (~7.5s) before triggering NO_FACE violation
+            if (missCount >= 5) { setFaceStatus('none'); addViolation('NO_FACE'); missCount = 3; }
+            else if (missCount >= 2) { setFaceStatus('none'); } // show status early but don't violate
           } else if (count > 1) {
             missCount = 0; mismatchCount = 0; multiCount++;
             if (multiCount >= 2) { setFaceStatus('multiple'); addViolation('MULTIPLE_FACES'); }
@@ -344,6 +390,25 @@ export default function ActiveQuiz({ webcamStream, micStream, screenStream, refe
               <Button onClick={() => document.documentElement.requestFullscreen().catch(() => {})}>
                 Return to Fullscreen
               </Button>
+            </CardContent>
+          </Card>
+        </div>
+      )}
+
+      {multiMonitorBlocked && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/95 backdrop-blur-sm">
+          <Card className="w-full max-w-md text-center">
+            <CardContent className="pt-8 pb-6 space-y-4">
+              <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-full bg-warning/10">
+                <Monitor className="h-8 w-8 text-warning" />
+              </div>
+              <h2 className="text-xl font-semibold text-foreground">Multiple Monitors Detected</h2>
+              <p className="text-sm text-muted-foreground">
+                Please disconnect all external displays and return to a single monitor to continue. This violation has been recorded.
+              </p>
+              <p className="text-xs text-muted-foreground">
+                The exam will resume automatically when only one screen is detected.
+              </p>
             </CardContent>
           </Card>
         </div>

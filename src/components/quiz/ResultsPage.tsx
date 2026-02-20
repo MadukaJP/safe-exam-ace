@@ -1,11 +1,12 @@
-import { useState } from 'react';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { useState, useMemo } from 'react';
+import { Card, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Dialog, DialogContent } from '@/components/ui/dialog';
-import { Check, X, AlertTriangle, RotateCcw, Shield, Clock, Camera, Monitor as MonitorIcon, Mic } from 'lucide-react';
-import { type Violation, type CaptureLog, type AudioClip, QUESTIONS, QUIZ_DURATION, formatTime } from '@/lib/quiz-types';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { Check, X, AlertTriangle, RotateCcw, Shield, Clock, Camera, Monitor as MonitorIcon, Mic, Download } from 'lucide-react';
+import { type Violation, type CaptureLog, type AudioClip, type ViolationType, QUESTIONS, VIOLATION_CONFIG, formatTime } from '@/lib/quiz-types';
 
 interface ResultsPageProps {
   answers: Record<number, number>;
@@ -16,15 +17,89 @@ interface ResultsPageProps {
   onRetake: () => void;
 }
 
+// All violation types for filter dropdown
+const ALL_VIOLATION_TYPES = Object.keys(VIOLATION_CONFIG) as ViolationType[];
+
+function generateReport(
+  answers: Record<number, number>,
+  violations: Violation[],
+  audioClips: AudioClip[],
+  timeSpent: number,
+  score: number,
+  pct: number,
+  passed: boolean
+): string {
+  const lines: string[] = [];
+  lines.push('═══════════════════════════════════════════');
+  lines.push('       PROCTORED EXAMINATION REPORT       ');
+  lines.push('═══════════════════════════════════════════');
+  lines.push('');
+  lines.push(`Date: ${new Date().toLocaleString()}`);
+  lines.push(`Duration: ${formatTime(timeSpent)}`);
+  lines.push(`Score: ${score}/${QUESTIONS.length} (${pct}%)`);
+  lines.push(`Result: ${passed ? 'PASSED' : 'FAILED'}`);
+  lines.push(`Total Violations: ${violations.length}`);
+  lines.push(`Critical Violations: ${violations.filter(v => v.severity === 'error').length}`);
+  lines.push(`Audio Clips Recorded: ${audioClips.length}`);
+  lines.push('');
+  lines.push('───────────────────────────────────────────');
+  lines.push('ANSWER REVIEW');
+  lines.push('───────────────────────────────────────────');
+  QUESTIONS.forEach(q => {
+    const ua = answers[q.id];
+    const ok = ua === q.correct;
+    lines.push(`Q${q.id}: ${q.question}`);
+    lines.push(`  Your answer: ${ua !== undefined ? q.options[ua] : 'Not answered'} ${ok ? '✓' : '✗'}`);
+    if (!ok) lines.push(`  Correct: ${q.options[q.correct]}`);
+    lines.push('');
+  });
+  if (violations.length > 0) {
+    lines.push('───────────────────────────────────────────');
+    lines.push('INTEGRITY VIOLATIONS');
+    lines.push('───────────────────────────────────────────');
+    violations.forEach(v => {
+      lines.push(`[${v.severity.toUpperCase()}] ${v.label} — ${v.timestamp.toLocaleTimeString()}`);
+      if (v.detail) lines.push(`  Detail: ${v.detail}`);
+      if (v.awayMs) lines.push(`  Away: ${(v.awayMs / 1000).toFixed(1)}s`);
+    });
+  }
+  lines.push('');
+  lines.push('═══════════════════════════════════════════');
+  lines.push('         END OF REPORT                    ');
+  lines.push('═══════════════════════════════════════════');
+  return lines.join('\n');
+}
+
 export default function ResultsPage({ answers, violations, captureLogs, audioClips, timeSpent, onRetake }: ResultsPageProps) {
   const [modalImg, setModalImg] = useState<string | null>(null);
+  const [violationFilter, setViolationFilter] = useState<string>('all');
 
   const score = QUESTIONS.reduce((a, q) => a + (answers[q.id] === q.correct ? 1 : 0), 0);
   const pct = Math.round((score / QUESTIONS.length) * 100);
   const passed = pct >= 60;
-  const webcamLogs = captureLogs.filter(l => l.kind === 'webcam');
-  const screenLogs = captureLogs.filter(l => l.kind === 'screen');
   const criticalViolations = violations.filter(v => v.severity === 'error').length;
+
+  // Get unique violation types present
+  const presentTypes = useMemo(() => {
+    const types = new Set(violations.map(v => v.type));
+    return ALL_VIOLATION_TYPES.filter(t => types.has(t));
+  }, [violations]);
+
+  const filteredViolations = useMemo(() => {
+    if (violationFilter === 'all') return violations;
+    return violations.filter(v => v.type === violationFilter);
+  }, [violations, violationFilter]);
+
+  const handleDownload = () => {
+    const report = generateReport(answers, violations, audioClips, timeSpent, score, pct, passed);
+    const blob = new Blob([report], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `exam-report-${new Date().toISOString().slice(0, 10)}.txt`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
 
   return (
     <div className="min-h-screen bg-background px-4 py-8">
@@ -33,12 +108,10 @@ export default function ResultsPage({ answers, violations, captureLogs, audioCli
         <Card>
           <CardContent className="pt-6">
             <div className="flex flex-col items-center gap-4 sm:flex-row sm:gap-8">
-              {/* Score ring */}
               <div className="relative flex h-36 w-36 shrink-0 items-center justify-center">
                 <svg className="h-full w-full -rotate-90" viewBox="0 0 120 120">
                   <circle cx="60" cy="60" r="52" fill="none" stroke="hsl(var(--border))" strokeWidth="8" />
-                  <circle
-                    cx="60" cy="60" r="52" fill="none"
+                  <circle cx="60" cy="60" r="52" fill="none"
                     stroke={passed ? 'hsl(var(--success))' : 'hsl(var(--destructive))'}
                     strokeWidth="8" strokeLinecap="round"
                     strokeDasharray={`${(pct / 100) * 327} 327`}
@@ -49,8 +122,6 @@ export default function ResultsPage({ answers, violations, captureLogs, audioCli
                   <span className="text-xs text-muted-foreground">{score}/{QUESTIONS.length}</span>
                 </div>
               </div>
-
-              {/* Details */}
               <div className="flex-1 space-y-3 text-center sm:text-left">
                 <div className="flex items-center justify-center gap-2 sm:justify-start">
                   <h1 className="text-2xl font-bold text-foreground">Examination Complete</h1>
@@ -70,12 +141,17 @@ export default function ResultsPage({ answers, violations, captureLogs, audioCli
 
         {/* Tabs */}
         <Tabs defaultValue="answers">
-          <TabsList className="w-full justify-start">
-            <TabsTrigger value="answers">Answers</TabsTrigger>
-            <TabsTrigger value="integrity">Integrity ({violations.length})</TabsTrigger>
-            <TabsTrigger value="captures">Captures ({captureLogs.length})</TabsTrigger>
-            <TabsTrigger value="audio">Audio ({audioClips.length})</TabsTrigger>
-          </TabsList>
+          <div className="flex items-center justify-between gap-2 flex-wrap">
+            <TabsList className="justify-start">
+              <TabsTrigger value="answers">Answers</TabsTrigger>
+              <TabsTrigger value="integrity">Integrity ({violations.length})</TabsTrigger>
+              <TabsTrigger value="captures">Captures ({captureLogs.length})</TabsTrigger>
+              <TabsTrigger value="audio">Audio ({audioClips.length})</TabsTrigger>
+            </TabsList>
+            <Button variant="outline" size="sm" onClick={handleDownload} className="gap-1.5">
+              <Download className="h-3.5 w-3.5" /> Download Report
+            </Button>
+          </div>
 
           {/* Answers */}
           <TabsContent value="answers" className="space-y-3">
@@ -97,9 +173,7 @@ export default function ResultsPage({ answers, violations, captureLogs, audioCli
                           Your answer: {ua !== undefined ? q.options[ua] : 'Not answered'}
                         </p>
                         {!ok && (
-                          <p className="text-sm text-success mt-0.5">
-                            Correct: {q.options[q.correct]}
-                          </p>
+                          <p className="text-sm text-success mt-0.5">Correct: {q.options[q.correct]}</p>
                         )}
                       </div>
                     </div>
@@ -111,21 +185,39 @@ export default function ResultsPage({ answers, violations, captureLogs, audioCli
 
           {/* Integrity */}
           <TabsContent value="integrity" className="space-y-3">
-            {violations.length === 0 ? (
+            {violations.length > 0 && (
+              <div className="flex items-center gap-2">
+                <span className="text-sm text-muted-foreground">Filter:</span>
+                <Select value={violationFilter} onValueChange={setViolationFilter}>
+                  <SelectTrigger className="w-56 h-8 text-xs">
+                    <SelectValue placeholder="All violations" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">All violations ({violations.length})</SelectItem>
+                    {presentTypes.map(t => (
+                      <SelectItem key={t} value={t}>
+                        {VIOLATION_CONFIG[t].label} ({violations.filter(v => v.type === t).length})
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+            )}
+            {filteredViolations.length === 0 ? (
               <Card>
                 <CardContent className="flex items-center gap-3 py-8 justify-center">
                   <Check className="h-6 w-6 text-success" />
-                  <p className="text-sm text-muted-foreground">No violations recorded. Clean session.</p>
+                  <p className="text-sm text-muted-foreground">
+                    {violations.length === 0 ? 'No violations recorded. Clean session.' : 'No violations match this filter.'}
+                  </p>
                 </CardContent>
               </Card>
-            ) : violations.map(v => (
+            ) : filteredViolations.map(v => (
               <Card key={v.id}>
                 <CardContent className="pt-4 pb-4 space-y-2">
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-2">
-                      <Badge variant={v.severity === 'error' ? 'destructive' : 'secondary'}>
-                        {v.severity}
-                      </Badge>
+                      <Badge variant={v.severity === 'error' ? 'destructive' : 'secondary'}>{v.severity}</Badge>
                       <span className="text-sm font-medium text-foreground">{v.label}</span>
                     </div>
                     <span className="text-xs text-muted-foreground">{v.timestamp.toLocaleTimeString()}</span>
@@ -165,9 +257,7 @@ export default function ResultsPage({ answers, violations, captureLogs, audioCli
                       <button key={l.id} onClick={() => setModalImg(l.dataUrl)} className="group relative overflow-hidden rounded-md border aspect-video">
                         <img src={l.dataUrl} alt={`${l.kind} capture`} className="h-full w-full object-cover" />
                         <div className="absolute bottom-0 left-0 right-0 bg-foreground/70 text-background flex items-center justify-between px-1.5 py-0.5">
-                          <Badge variant="outline" className="text-[9px] px-1 py-0 h-auto border-background/30 text-background">
-                            {l.trigger}
-                          </Badge>
+                          <Badge variant="outline" className="text-[9px] px-1 py-0 h-auto border-background/30 text-background">{l.trigger}</Badge>
                           <span className="text-[9px]">{l.timestamp.toLocaleTimeString()}</span>
                         </div>
                         <div className="absolute top-1 left-1">
