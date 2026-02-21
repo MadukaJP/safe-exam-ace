@@ -400,6 +400,9 @@ export default function ResultsPage({ answers, violations, captureLogs, audioCli
                       </div>
                       {v.detail && <p className="text-xs text-muted-foreground">{v.detail}</p>}
                       {v.awayMs && <p className="text-xs text-muted-foreground">Away for {(v.awayMs / 1000).toFixed(1)}s</p>}
+                      {v.audioUrl && (
+                        <audio controls src={v.audioUrl} className="w-full h-8" />
+                      )}
                       {(v.webcamShot || v.screenShot) && (
                         <div className="flex gap-2">
                           {v.webcamShot && (

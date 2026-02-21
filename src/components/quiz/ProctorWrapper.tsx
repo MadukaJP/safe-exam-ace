@@ -7,9 +7,12 @@ import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover
 import { AlertTriangle, Eye, Mic, Monitor, Maximize, Shield, Clock } from 'lucide-react';
 import {
   type Violation, type CaptureLog, type AudioClip, type ViolationType,
-  VIOLATION_CONFIG, uid, formatTime,
+  VIOLATION_CONFIG, VIOLATION_TOAST, uid, formatTime,
 } from '@/lib/quiz-types';
-import { detectFaces, extractEmbedding, cosineSimilarity, snapStream } from '@/lib/proctoring';
+import {
+  detectFaces, extractEmbeddingFromLandmarks, cosineSimilarity,
+  snapStream, getHeadYaw, getHeadPitch, detectMultipleMonitors,
+} from '@/lib/proctoring';
 
 export interface ProctorData {
   violations: Violation[];
@@ -27,6 +30,7 @@ interface ProctorWrapperProps {
   screenStream: MediaStream;
   referenceEmbedding: number[] | null;
   durationSeconds: number;
+  proctorEnabled?: boolean;
   examTitle?: string;
   onTimeUp: (data: { violations: Violation[]; captureLogs: CaptureLog[]; audioClips: AudioClip[]; timeSpent: number }) => void;
   onManualSubmit: (data: { violations: Violation[]; captureLogs: CaptureLog[]; audioClips: AudioClip[]; timeSpent: number }) => void;
@@ -35,7 +39,7 @@ interface ProctorWrapperProps {
 
 export default function ProctorWrapper({
   webcamStream, micStream, screenStream, referenceEmbedding,
-  durationSeconds, examTitle = 'Proctored Exam',
+  durationSeconds, proctorEnabled = true, examTitle = 'Proctored Exam',
   onTimeUp, onManualSubmit, children,
 }: ProctorWrapperProps) {
   const [violations, setViolations] = useState<Violation[]>([]);
@@ -48,6 +52,7 @@ export default function ProctorWrapper({
   const [fullscreenBlocked, setFullscreenBlocked] = useState(false);
   const [multiMonitorBlocked, setMultiMonitorBlocked] = useState(false);
   const [pendingSubmit, setPendingSubmit] = useState(false);
+  const [screenShareCountdown, setScreenShareCountdown] = useState<number | null>(null);
 
   const webcamRef = useRef(webcamStream);
   const micRef = useRef(micStream);
@@ -60,6 +65,10 @@ export default function ProctorWrapper({
   const violationsRef = useRef<Violation[]>([]);
   const captureLogsRef = useRef<CaptureLog[]>([]);
   const submittedRef = useRef(false);
+  const screenStopCountRef = useRef(0);
+  const screenCountdownRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const gazeAwayStartRef = useRef<number | null>(null);
+  const audioRecorderRef = useRef<MediaRecorder | null>(null);
 
   useEffect(() => { violationsRef.current = violations; }, [violations]);
   useEffect(() => { captureLogsRef.current = captureLogs; }, [captureLogs]);
@@ -71,17 +80,16 @@ export default function ProctorWrapper({
 
   const addViolation = useCallback(async (
     type: ViolationType,
-    opts: { captureScreen?: boolean; awayMs?: number; detail?: string; skipCooldown?: boolean } = {}
+    opts: { captureScreen?: boolean; awayMs?: number; detail?: string; skipCooldown?: boolean; audioUrl?: string } = {}
   ) => {
     const now = Date.now();
     if (!opts.skipCooldown && type !== 'TAB_SWITCH' && (cooldownRef.current[type] ?? 0) + 10_000 > now) return;
-    cooldownRef.current[type] = now;
+    if (!opts.skipCooldown) cooldownRef.current[type] = now;
 
     const cfg = VIOLATION_CONFIG[type];
-    (cfg.severity === 'error' ? toast.error : toast.warning)(
-      `⚠️ ${cfg.label}`,
-      { description: opts.awayMs ? `Away ${(opts.awayMs / 1000).toFixed(1)}s` : opts.detail ?? 'Recorded.', duration: 4000 }
-    );
+    const msg = VIOLATION_TOAST[type] ?? cfg.label;
+    const awayStr = opts.awayMs ? ` (${(opts.awayMs / 1000).toFixed(1)}s)` : '';
+    (cfg.severity === 'error' ? toast.error : toast.warning)(msg + awayStr, { duration: 4000 });
 
     const [webcamShot, screenShot] = await Promise.all([
       snapStream(webcamRef.current),
@@ -90,14 +98,18 @@ export default function ProctorWrapper({
 
     const v: Violation = {
       id: uid(), type, label: cfg.label, severity: cfg.severity,
-      timestamp: new Date(), webcamShot, screenShot, awayMs: opts.awayMs, detail: opts.detail,
+      timestamp: new Date(), webcamShot, screenShot, audioUrl: opts.audioUrl,
+      awayMs: opts.awayMs, detail: opts.detail,
     };
     setViolations(prev => [...prev, v]);
     if (webcamShot) logCapture('webcam', webcamShot, 'violation');
     if (screenShot) logCapture('screen', screenShot, 'violation');
+    return v.id;
   }, [logCapture]);
 
-  // Keyboard blocking
+  // ══════════════════════════════════════════════════════════════════
+  // KEYBOARD BLOCKING (always active)
+  // ══════════════════════════════════════════════════════════════════
   useEffect(() => {
     const BLOCKED = new Set(['F12', 'F11', 'F5']);
     const handler = (e: KeyboardEvent) => {
@@ -115,22 +127,39 @@ export default function ProctorWrapper({
       if (isBlocked) {
         e.preventDefault();
         e.stopPropagation();
-        addViolation('KEYBOARD_SHORTCUT', { detail: `${ctrl ? 'Ctrl+' : ''}${shift ? 'Shift+' : ''}${e.altKey ? 'Alt+' : ''}${key}` });
+        if (proctorEnabled) {
+          addViolation('KEYBOARD_SHORTCUT', { detail: `${ctrl ? 'Ctrl+' : ''}${shift ? 'Shift+' : ''}${e.altKey ? 'Alt+' : ''}${key}` });
+        }
       }
     };
     window.addEventListener('keydown', handler, true);
     return () => window.removeEventListener('keydown', handler, true);
-  }, [addViolation]);
+  }, [addViolation, proctorEnabled]);
 
-  // Tab, clipboard, fullscreen, multi-monitor, devtools
+  // ══════════════════════════════════════════════════════════════════
+  // TAB, CLIPBOARD, FULLSCREEN, MULTI-MONITOR, DEVTOOLS, SCREEN SHARE
+  // ══════════════════════════════════════════════════════════════════
   useEffect(() => {
+    if (!proctorEnabled) return;
+
+    // Tab switch — capture screenshot IMMEDIATELY when leaving
     const onVisibility = async () => {
       if (document.hidden) {
         tabHiddenAtRef.current = Date.now();
+        // Capture screen NOW while leaving
+        await addViolation('TAB_SWITCH', { captureScreen: true });
       } else {
         const awayMs = tabHiddenAtRef.current ? Date.now() - tabHiddenAtRef.current : undefined;
         tabHiddenAtRef.current = null;
-        await addViolation('TAB_SWITCH', { captureScreen: true, awayMs });
+        if (awayMs) {
+          // Update the last TAB_SWITCH violation with away duration
+          setViolations(prev => {
+            const copy = [...prev];
+            const last = [...copy].reverse().find(v => v.type === 'TAB_SWITCH');
+            if (last) last.awayMs = awayMs;
+            return copy;
+          });
+        }
       }
     };
     const onBlur = () => addViolation('WINDOW_BLUR');
@@ -147,10 +176,12 @@ export default function ProctorWrapper({
       }
     };
 
+    // Multiple monitor detection
     const checkMonitors = () => {
-      if ((window.screen as any).isExtended) {
+      const { detected, reason } = detectMultipleMonitors();
+      if (detected) {
         setMultiMonitorBlocked(true);
-        addViolation('MULTIPLE_MONITORS', { detail: 'Extended display detected' });
+        addViolation('MULTIPLE_MONITORS', { detail: reason });
       } else {
         setMultiMonitorBlocked(false);
       }
@@ -163,6 +194,40 @@ export default function ProctorWrapper({
         addViolation('DEVTOOLS_OPEN');
     }, 3000);
 
+    // Screen share stop → countdown logic
+    const track = screenRef.current?.getVideoTracks()[0];
+    const onScreenEnded = () => {
+      setScreenOk(false);
+      screenStopCountRef.current += 1;
+      const stopCount = screenStopCountRef.current;
+
+      if (stopCount >= 2) {
+        // Second time → end quiz immediately
+        addViolation('SCREEN_SHARE_STOPPED', { detail: 'Screen sharing stopped a second time — exam ended.' });
+        doFinish(onManualSubmit);
+        return;
+      }
+
+      // First time → 5 second countdown
+      addViolation('SCREEN_SHARE_STOPPED');
+      let remaining = 5;
+      setScreenShareCountdown(remaining);
+      screenCountdownRef.current = setInterval(() => {
+        remaining--;
+        setScreenShareCountdown(remaining);
+        if (remaining <= 0) {
+          if (screenCountdownRef.current) clearInterval(screenCountdownRef.current);
+          screenCountdownRef.current = null;
+          setScreenShareCountdown(null);
+          // If screen wasn't reshared, end quiz
+          if (!screenRef.current?.getVideoTracks()[0]?.readyState || screenRef.current.getVideoTracks()[0].readyState !== 'live') {
+            doFinish(onManualSubmit);
+          }
+        }
+      }, 1000);
+    };
+    track?.addEventListener('ended', onScreenEnded);
+
     document.addEventListener('visibilitychange', onVisibility);
     window.addEventListener('blur', onBlur);
     document.addEventListener('copy', onClip as EventListener);
@@ -170,10 +235,6 @@ export default function ProctorWrapper({
     document.addEventListener('paste', onClip as EventListener);
     document.addEventListener('contextmenu', onCtx);
     document.addEventListener('fullscreenchange', onFs);
-
-    const track = screenRef.current?.getVideoTracks()[0];
-    const onEnded = () => { setScreenOk(false); addViolation('SCREEN_SHARE_STOPPED'); };
-    track?.addEventListener('ended', onEnded);
 
     return () => {
       document.removeEventListener('visibilitychange', onVisibility);
@@ -183,18 +244,137 @@ export default function ProctorWrapper({
       document.removeEventListener('paste', onClip as EventListener);
       document.removeEventListener('contextmenu', onCtx);
       document.removeEventListener('fullscreenchange', onFs);
-      track?.removeEventListener('ended', onEnded);
+      track?.removeEventListener('ended', onScreenEnded);
       clearInterval(devtools);
       clearInterval(monitorInterval);
+      if (screenCountdownRef.current) clearInterval(screenCountdownRef.current);
     };
-  }, [addViolation, logCapture]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [addViolation, logCapture, proctorEnabled]);
 
-  // Audio monitoring — lowered threshold to 35 for low talking detection
+  // Reshare screen handler
+  const handleReshareScreen = useCallback(async () => {
+    try {
+      const newScreen = await navigator.mediaDevices.getDisplayMedia({
+        video: { displaySurface: 'monitor' } as MediaTrackConstraints,
+        audio: false,
+      });
+      const surface = (newScreen.getVideoTracks()[0].getSettings() as any).displaySurface;
+      if (surface && surface !== 'monitor') {
+        newScreen.getTracks().forEach(t => t.stop());
+        toast.error('You must share your entire screen.');
+        return;
+      }
+      screenRef.current = newScreen;
+      setScreenOk(true);
+      setScreenShareCountdown(null);
+      if (screenCountdownRef.current) {
+        clearInterval(screenCountdownRef.current);
+        screenCountdownRef.current = null;
+      }
+      // Listen for next stop
+      newScreen.getVideoTracks()[0].addEventListener('ended', () => {
+        setScreenOk(false);
+        screenStopCountRef.current += 1;
+        addViolation('SCREEN_SHARE_STOPPED', { detail: 'Screen sharing stopped again — exam ended.' });
+        doFinish(onManualSubmit);
+      });
+      toast.success('Screen sharing resumed.');
+    } catch {
+      toast.error('Screen share was not started.');
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [addViolation]);
+
+  // ══════════════════════════════════════════════════════════════════
+  // AUDIO MONITORING — calibration-based from reference
+  // ══════════════════════════════════════════════════════════════════
   useEffect(() => {
+    if (!proctorEnabled) return;
+
+    const CALIBRATION_FRAMES = 120;
+    const NOISE_MARGIN = 12;
+    const NOISE_COOLDOWN_MS = 12_000;
+    const RECORD_DURATION_MS = 12_000;
+
     let animFrame: number;
-    let recorder: MediaRecorder | null = null;
-    let voiceStartTime: number | null = null;
-    let violated = false;
+    let voiceFrames = 0;
+    const calSamples: number[] = [];
+    let baseline = 28;
+    let calibrated = false;
+    let saving = false;
+    let lastNoiseFlagMs = -Infinity;
+
+    // SpeechRecognition for voice classification
+    let isSpeechActive = false;
+    let speechEndedAt: number | null = null;
+    const SpeechRec =
+      (window as any).SpeechRecognition ?? (window as any).webkitSpeechRecognition ?? null;
+    const speechSupported = !!SpeechRec;
+    let recognition: any = null;
+
+    if (speechSupported && SpeechRec) {
+      try {
+        recognition = new SpeechRec();
+        recognition.continuous = true;
+        recognition.interimResults = false;
+        recognition.lang = 'en-US';
+        recognition.onspeechstart = () => { isSpeechActive = true; speechEndedAt = null; };
+        recognition.onspeechend = () => { isSpeechActive = false; speechEndedAt = performance.now(); };
+        recognition.onend = () => { try { recognition?.start(); } catch { /**/ } };
+        recognition.onerror = () => { /* restart handled by onend */ };
+        recognition.start();
+      } catch { /* fallback to volume-only */ }
+    }
+
+    const recordAndAttach = (noiseViolationId: string, triggerMs: number, avgLevel: number) => {
+      if (!micRef.current) return;
+      saving = true;
+      let mimeType = 'audio/webm';
+      if (!MediaRecorder.isTypeSupported(mimeType)) mimeType = 'audio/ogg';
+      if (!MediaRecorder.isTypeSupported(mimeType)) mimeType = '';
+
+      let rec: MediaRecorder;
+      try {
+        rec = new MediaRecorder(micRef.current, mimeType ? { mimeType } : undefined);
+      } catch { saving = false; return; }
+
+      const chunks: BlobPart[] = [];
+      rec.ondataavailable = e => { if (e.data && e.data.size > 0) chunks.push(e.data); };
+      rec.onstop = () => {
+        saving = false;
+        const blob = new Blob(chunks, { type: mimeType || 'audio/webm' });
+        if (blob.size < 200) return;
+        const reader = new FileReader();
+        reader.onloadend = () => {
+          const dataUrl = reader.result as string;
+          const clip = { timestamp: new Date(), dataUrl };
+          audioClipsRef.current = [...audioClipsRef.current, clip];
+          setAudioClips(prev => [...prev, clip]);
+          // Attach to noise violation
+          setViolations(prev => prev.map(v =>
+            v.id === noiseViolationId ? { ...v, audioUrl: dataUrl } : v
+          ));
+          // If speech confirmed → also fire AUDIO_DETECTED
+          const nowMs = performance.now();
+          const speechInWindow =
+            !speechSupported || isSpeechActive ||
+            (speechEndedAt !== null && speechEndedAt >= triggerMs - 1000 && speechEndedAt <= nowMs + 500);
+          if (speechInWindow) {
+            addViolation('AUDIO_DETECTED', { detail: `Level ${avgLevel.toFixed(0)}, baseline ${baseline.toFixed(0)}` });
+          }
+        };
+        reader.readAsDataURL(blob);
+      };
+      rec.start();
+      audioRecorderRef.current = rec;
+      setTimeout(() => {
+        if (rec.state === 'recording') {
+          rec.requestData();
+          setTimeout(() => { if (rec.state === 'recording') rec.stop(); }, 100);
+        }
+      }, RECORD_DURATION_MS);
+    };
 
     try {
       const ctx = new AudioContext();
@@ -203,18 +383,6 @@ export default function ProctorWrapper({
       analyser.fftSize = 512;
       source.connect(analyser);
       const buf = new Uint8Array(analyser.frequencyBinCount);
-
-      let preRecorder: MediaRecorder | null = null;
-      let preChunks: BlobPart[] = [];
-      const startPreRecording = () => {
-        try {
-          preChunks = [];
-          preRecorder = new MediaRecorder(micRef.current, { mimeType: 'audio/webm' });
-          preRecorder.ondataavailable = e => { if (e.data.size > 0) preChunks.push(e.data); };
-          preRecorder.start(500);
-        } catch { preRecorder = null; }
-      };
-      startPreRecording();
 
       const check = () => {
         analyser.getByteFrequencyData(buf);
@@ -226,47 +394,42 @@ export default function ProctorWrapper({
         const avg = sum / (high - low);
         setAudioLevel(avg);
 
-        const now = Date.now();
+        if (!calibrated) {
+          calSamples.push(avg);
+          if (calSamples.length >= CALIBRATION_FRAMES) {
+            const sorted = [...calSamples].sort((a, b) => a - b);
+            baseline = sorted[Math.floor(sorted.length * 0.80)];
+            calibrated = true;
+          }
+          animFrame = requestAnimationFrame(check);
+          return;
+        }
 
-        if (avg > 35) {
-          if (!voiceStartTime) voiceStartTime = now;
-
-          if (!violated && now - voiceStartTime >= 3000) {
-            violated = true;
-            addViolation('AUDIO_DETECTED', { detail: `Sustained speech detected (${((now - voiceStartTime) / 1000).toFixed(1)}s)` });
-
-            if (preRecorder && preRecorder.state !== 'inactive') {
-              preRecorder.stop();
-            }
-
-            if (!recorder || recorder.state === 'inactive') {
-              try {
-                const chunks: BlobPart[] = [...preChunks];
-                recorder = new MediaRecorder(micRef.current, { mimeType: 'audio/webm' });
-                recorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
-                recorder.onstop = () => {
-                  const blob = new Blob(chunks, { type: 'audio/webm' });
-                  const reader = new FileReader();
-                  reader.onloadend = () => {
-                    const clip: AudioClip = { timestamp: new Date(), dataUrl: reader.result as string };
-                    audioClipsRef.current = [...audioClipsRef.current, clip];
-                    setAudioClips(prev => [...prev, clip]);
-                  };
-                  reader.readAsDataURL(blob);
-                };
-                recorder.start();
-                setTimeout(() => { recorder?.stop(); recorder = null; }, 10000);
-              } catch { }
+        if (avg > baseline + NOISE_MARGIN) {
+          voiceFrames++;
+          if (voiceFrames >= 5 && !saving) {
+            const nowMs = performance.now();
+            voiceFrames = 0;
+            if (nowMs - lastNoiseFlagMs > NOISE_COOLDOWN_MS) {
+              lastNoiseFlagMs = nowMs;
+              const vid = uid();
+              const v: Violation = {
+                id: vid, type: 'NOISE_DETECTED',
+                label: VIOLATION_CONFIG['NOISE_DETECTED'].label,
+                severity: VIOLATION_CONFIG['NOISE_DETECTED'].severity,
+                timestamp: new Date(),
+                detail: `Level ${avg.toFixed(0)}, baseline ${baseline.toFixed(0)}`,
+              };
+              snapStream(webcamRef.current).then(shot => {
+                if (shot) { v.webcamShot = shot; logCapture('webcam', shot, 'violation'); }
+                setViolations(prev => [...prev, v]);
+                toast.warning(VIOLATION_TOAST['NOISE_DETECTED'], { duration: 4000 });
+              });
+              recordAndAttach(vid, nowMs, avg);
             }
           }
         } else {
-          if (voiceStartTime && now - voiceStartTime > 500) {
-            voiceStartTime = null;
-            violated = false;
-            if (!preRecorder || preRecorder.state === 'inactive') {
-              startPreRecording();
-            }
-          }
+          voiceFrames = Math.max(0, voiceFrames - 1);
         }
         animFrame = requestAnimationFrame(check);
       };
@@ -274,15 +437,19 @@ export default function ProctorWrapper({
 
       return () => {
         cancelAnimationFrame(animFrame);
-        recorder?.stop();
-        preRecorder?.stop();
+        try { recognition?.stop(); } catch { /**/ }
+        audioRecorderRef.current?.stop();
         ctx.close();
       };
-    } catch { }
-  }, [addViolation]);
+    } catch { /* audio context failed */ }
+  }, [addViolation, logCapture, proctorEnabled]);
 
-  // Face detection
+  // ══════════════════════════════════════════════════════════════════
+  // FACE DETECTION + IDENTITY + GAZE
+  // ══════════════════════════════════════════════════════════════════
   useEffect(() => {
+    if (!proctorEnabled) return;
+
     const video = document.createElement('video');
     video.muted = true;
     video.playsInline = true;
@@ -294,33 +461,70 @@ export default function ProctorWrapper({
     let running = true;
     let missCount = 0, multiCount = 0, mismatchCount = 0;
     let lastCheck = 0;
+    const CHECK_MS = 200;
+    const GAZE_YAW_THRESHOLD = 25;
+    const GAZE_PITCH_THRESHOLD = 30;
+    const GAZE_AWAY_MS = 1500;
 
     const loop = async () => {
       if (!running) return;
       const now = performance.now();
-      if (now - lastCheck >= 1500) {
+      if (now - lastCheck >= CHECK_MS) {
         lastCheck = now;
         const res = await detectFaces(video);
         if (res) {
-          const count = res.detections.length;
+          const count = res.faceLandmarks?.length ?? 0;
           if (count === 0) {
             multiCount = 0; mismatchCount = 0; missCount++;
-            if (missCount >= 5) { setFaceStatus('none'); addViolation('NO_FACE'); missCount = 3; }
-            else if (missCount >= 2) { setFaceStatus('none'); }
+            gazeAwayStartRef.current = null;
+            // 3 misses at 200ms = ~0.6s, then violation. Resets to allow re-trigger.
+            if (missCount >= 3) { setFaceStatus('none'); addViolation('NO_FACE'); missCount = 0; }
           } else if (count > 1) {
             missCount = 0; mismatchCount = 0; multiCount++;
-            if (multiCount >= 2) { setFaceStatus('multiple'); addViolation('MULTIPLE_FACES'); }
+            gazeAwayStartRef.current = null;
+            if (multiCount >= 2) { setFaceStatus('multiple'); addViolation('MULTIPLE_FACES'); multiCount = 0; }
           } else {
             missCount = 0; multiCount = 0;
-            const box = res.detections[0].boundingBox!;
-            const emb = extractEmbedding(video, { originX: box.originX, originY: box.originY, width: box.width, height: box.height });
+
+            // Gaze detection via head pose matrix
+            const matrix = res.facialTransformationMatrixes?.[0]?.data;
+            if (matrix) {
+              const yaw = getHeadYaw(matrix as unknown as number[]);
+              const pitch = getHeadPitch(matrix as unknown as number[]);
+              const lookingAway = Math.abs(yaw) > GAZE_YAW_THRESHOLD || Math.abs(pitch) > GAZE_PITCH_THRESHOLD;
+              if (lookingAway) {
+                if (!gazeAwayStartRef.current) gazeAwayStartRef.current = now;
+                const awayMs = now - gazeAwayStartRef.current;
+                if (awayMs >= GAZE_AWAY_MS) {
+                  setFaceStatus('mismatch');
+                  addViolation('GAZE_AWAY', { detail: `Yaw: ${yaw.toFixed(0)}°, Pitch: ${pitch.toFixed(0)}°` });
+                  gazeAwayStartRef.current = now;
+                }
+              } else {
+                gazeAwayStartRef.current = null;
+              }
+            }
+
+            // Identity check using landmark embedding
+            const landmarks = res.faceLandmarks[0];
+            const emb = extractEmbeddingFromLandmarks(landmarks);
             if (emb && embeddingRef.current) {
               const sim = cosineSimilarity(emb, embeddingRef.current);
               if (sim < 0.72) {
                 mismatchCount++;
-                if (mismatchCount >= 3) { setFaceStatus('mismatch'); addViolation('IDENTITY_MISMATCH', { detail: `Similarity: ${(sim * 100).toFixed(0)}%` }); }
-              } else { mismatchCount = 0; setFaceStatus('ok'); }
-            } else { mismatchCount = 0; setFaceStatus('ok'); }
+                if (mismatchCount >= 3) {
+                  setFaceStatus('mismatch');
+                  addViolation('IDENTITY_MISMATCH', { detail: `Similarity: ${(sim * 100).toFixed(0)}%`, skipCooldown: true });
+                  mismatchCount = 0;
+                }
+              } else {
+                mismatchCount = 0;
+                if (!gazeAwayStartRef.current) setFaceStatus('ok');
+              }
+            } else {
+              mismatchCount = 0;
+              if (!gazeAwayStartRef.current) setFaceStatus('ok');
+            }
           }
         }
       }
@@ -329,10 +533,11 @@ export default function ProctorWrapper({
     requestAnimationFrame(loop);
 
     return () => { running = false; video.pause(); video.srcObject = null; video.remove(); };
-  }, [addViolation]);
+  }, [addViolation, proctorEnabled]);
 
   // Periodic captures
   useEffect(() => {
+    if (!proctorEnabled) return;
     const interval = setInterval(async () => {
       const [wShot, sShot] = await Promise.all([
         snapStream(webcamRef.current),
@@ -340,9 +545,9 @@ export default function ProctorWrapper({
       ]);
       if (wShot) logCapture('webcam', wShot, 'periodic');
       if (sShot) logCapture('screen', sShot, 'periodic');
-    }, 15_000);
+    }, 7_000);
     return () => clearInterval(interval);
-  }, [logCapture]);
+  }, [logCapture, proctorEnabled]);
 
   const stopAll = useCallback(() => {
     webcamRef.current?.getTracks().forEach(t => t.stop());
@@ -354,6 +559,7 @@ export default function ProctorWrapper({
     if (submittedRef.current) return;
     submittedRef.current = true;
     if (timerRef.current) clearInterval(timerRef.current);
+    if (screenCountdownRef.current) clearInterval(screenCountdownRef.current);
     stopAll();
     if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
     cb({
@@ -364,10 +570,7 @@ export default function ProctorWrapper({
     });
   }, [stopAll, durationSeconds, timeLeft]);
 
-  const requestSubmit = useCallback(() => {
-    setPendingSubmit(true);
-  }, []);
-
+  const requestSubmit = useCallback(() => { setPendingSubmit(true); }, []);
   const confirmSubmit = useCallback(() => {
     setPendingSubmit(false);
     doFinish(onManualSubmit);
@@ -392,7 +595,7 @@ export default function ProctorWrapper({
   return (
     <div className="flex min-h-screen flex-col bg-background">
       {/* Fullscreen overlay */}
-      {fullscreenBlocked && (
+      {fullscreenBlocked && proctorEnabled && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/95 backdrop-blur-sm">
           <Card className="w-full max-w-md text-center">
             <CardContent className="pt-8 pb-6 space-y-4">
@@ -401,7 +604,7 @@ export default function ProctorWrapper({
               </div>
               <h2 className="text-xl font-semibold text-foreground">Fullscreen Required</h2>
               <p className="text-sm text-muted-foreground">
-                You exited fullscreen. This has been recorded as a violation. Return to fullscreen to continue.
+                You exited fullscreen. This has been recorded. Return to fullscreen to continue.
               </p>
               <Button onClick={() => document.documentElement.requestFullscreen().catch(() => {})}>
                 Return to Fullscreen
@@ -412,20 +615,44 @@ export default function ProctorWrapper({
       )}
 
       {/* Multi-monitor overlay */}
-      {multiMonitorBlocked && (
+      {multiMonitorBlocked && proctorEnabled && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/95 backdrop-blur-sm">
           <Card className="w-full max-w-md text-center">
             <CardContent className="pt-8 pb-6 space-y-4">
               <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-full bg-warning/10">
                 <Monitor className="h-8 w-8 text-warning" />
               </div>
-              <h2 className="text-xl font-semibold text-foreground">Multiple Monitors Detected</h2>
+              <h2 className="text-xl font-semibold text-foreground">Multiple Displays Detected</h2>
               <p className="text-sm text-muted-foreground">
-                Please disconnect all external displays and return to a single monitor to continue.
+                Please disconnect all external displays and return to a single monitor.
               </p>
               <p className="text-xs text-muted-foreground">
                 The exam will resume automatically when only one screen is detected.
               </p>
+            </CardContent>
+          </Card>
+        </div>
+      )}
+
+      {/* Screen share lost — countdown overlay */}
+      {screenShareCountdown !== null && proctorEnabled && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/95 backdrop-blur-sm">
+          <Card className="w-full max-w-md text-center">
+            <CardContent className="pt-8 pb-6 space-y-4">
+              <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-full bg-destructive/10">
+                <Monitor className="h-8 w-8 text-destructive" />
+              </div>
+              <h2 className="text-xl font-semibold text-foreground">Screen Sharing Stopped</h2>
+              <p className="text-sm text-muted-foreground">
+                Your screen share was interrupted. Resume sharing within{' '}
+                <span className="font-bold text-destructive">{screenShareCountdown}s</span> or the exam will end.
+              </p>
+              <p className="text-xs text-muted-foreground">
+                Note: Stopping screen share a second time will end the exam immediately.
+              </p>
+              <Button onClick={handleReshareScreen}>
+                <Monitor className="mr-2 h-4 w-4" /> Share Screen Again
+              </Button>
             </CardContent>
           </Card>
         </div>
@@ -453,58 +680,65 @@ export default function ProctorWrapper({
           <div className="flex items-center gap-3">
             <Shield className="h-5 w-5 text-primary" />
             <p className="text-xs text-muted-foreground uppercase tracking-wider">{examTitle}</p>
+            {!proctorEnabled && (
+              <Badge variant="secondary" className="text-[10px]">Proctor Off</Badge>
+            )}
           </div>
 
-          <div className={`text-2xl font-bold font-mono ${urgent ? 'text-destructive animate-pulse-red' : 'text-foreground'}`}>
+          <div className={`text-2xl font-bold font-mono ${urgent ? 'text-destructive animate-pulse' : 'text-foreground'}`}>
             <Clock className="inline-block mr-1 h-5 w-5" />
             {formatTime(timeLeft)}
           </div>
 
           <div className="flex items-center gap-2">
-            <Badge variant="outline" className={`text-xs ${faceColors[faceStatus]}`}>
-              <Eye className="mr-1 h-3 w-3" /> {faceLabels[faceStatus]}
-            </Badge>
-            <Badge variant="outline" className={`text-xs ${screenOk ? 'bg-success/10 text-success' : 'bg-destructive/10 text-destructive'}`}>
-              <Monitor className="mr-1 h-3 w-3" /> {screenOk ? 'Screen ✓' : 'No Screen'}
-            </Badge>
-            <div className="flex items-center gap-1">
-              <Mic className="h-3 w-3 text-muted-foreground" />
-              <div className="h-2 w-10 overflow-hidden rounded-full bg-muted">
-                <div
-                  className="h-full rounded-full transition-all duration-100"
-                  style={{
-                    width: `${audioBar}%`,
-                    backgroundColor: audioBar > 80 ? 'hsl(var(--destructive))' : audioBar > 40 ? 'hsl(var(--warning))' : 'hsl(var(--success))'
-                  }}
-                />
-              </div>
-            </div>
-            <Popover>
-              <PopoverTrigger asChild>
-                <Button variant="outline" size="sm" className="h-7 gap-1 text-xs">
-                  <AlertTriangle className="h-3 w-3" />
-                  {violations.length}
-                </Button>
-              </PopoverTrigger>
-              <PopoverContent className="w-72" align="end">
-                <p className="text-sm font-medium mb-2">Recent Violations</p>
-                {violations.length === 0 ? (
-                  <p className="text-xs text-muted-foreground">No violations yet</p>
-                ) : (
-                  <div className="max-h-48 space-y-1.5 overflow-y-auto">
-                    {violations.slice(-5).reverse().map(v => (
-                      <div key={v.id} className="flex items-center gap-2 rounded bg-muted p-1.5 text-xs">
-                        <Badge variant={v.severity === 'error' ? 'destructive' : 'secondary'} className="text-[10px] px-1.5 py-0">
-                          {v.severity}
-                        </Badge>
-                        <span className="flex-1 truncate">{v.label}</span>
-                        <span className="text-muted-foreground">{v.timestamp.toLocaleTimeString()}</span>
-                      </div>
-                    ))}
+            {proctorEnabled && (
+              <>
+                <Badge variant="outline" className={`text-xs ${faceColors[faceStatus]}`}>
+                  <Eye className="mr-1 h-3 w-3" /> {faceLabels[faceStatus]}
+                </Badge>
+                <Badge variant="outline" className={`text-xs ${screenOk ? 'bg-success/10 text-success' : 'bg-destructive/10 text-destructive'}`}>
+                  <Monitor className="mr-1 h-3 w-3" /> {screenOk ? 'Screen ✓' : 'No Screen'}
+                </Badge>
+                <div className="flex items-center gap-1">
+                  <Mic className="h-3 w-3 text-muted-foreground" />
+                  <div className="h-2 w-10 overflow-hidden rounded-full bg-muted">
+                    <div
+                      className="h-full rounded-full transition-all duration-100"
+                      style={{
+                        width: `${audioBar}%`,
+                        backgroundColor: audioBar > 80 ? 'hsl(var(--destructive))' : audioBar > 40 ? 'hsl(var(--warning))' : 'hsl(var(--success))'
+                      }}
+                    />
                   </div>
-                )}
-              </PopoverContent>
-            </Popover>
+                </div>
+                <Popover>
+                  <PopoverTrigger asChild>
+                    <Button variant="outline" size="sm" className="h-7 gap-1 text-xs">
+                      <AlertTriangle className="h-3 w-3" />
+                      {violations.length}
+                    </Button>
+                  </PopoverTrigger>
+                  <PopoverContent className="w-72" align="end">
+                    <p className="text-sm font-medium mb-2">Recent Violations</p>
+                    {violations.length === 0 ? (
+                      <p className="text-xs text-muted-foreground">No violations yet</p>
+                    ) : (
+                      <div className="max-h-48 space-y-1.5 overflow-y-auto">
+                        {violations.slice(-5).reverse().map(v => (
+                          <div key={v.id} className="flex items-center gap-2 rounded bg-muted p-1.5 text-xs">
+                            <Badge variant={v.severity === 'error' ? 'destructive' : 'secondary'} className="text-[10px] px-1.5 py-0">
+                              {v.severity}
+                            </Badge>
+                            <span className="flex-1 truncate">{v.label}</span>
+                            <span className="text-muted-foreground">{v.timestamp.toLocaleTimeString()}</span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </PopoverContent>
+                </Popover>
+              </>
+            )}
           </div>
         </div>
       </header>

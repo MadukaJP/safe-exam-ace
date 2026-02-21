@@ -5,8 +5,10 @@ import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Progress } from '@/components/ui/progress';
+import { Switch } from '@/components/ui/switch';
+import { Label } from '@/components/ui/label';
 import { toast } from 'sonner';
-import { getDetector, detectFaces, extractEmbedding } from '@/lib/proctoring';
+import { getLandmarker, detectFaces, extractEmbeddingFromLandmarks, detectMultipleMonitors } from '@/lib/proctoring';
 
 interface SetupWizardProps {
   onComplete: (data: {
@@ -14,6 +16,7 @@ interface SetupWizardProps {
     micStream: MediaStream;
     screenStream: MediaStream;
     referenceEmbedding: number[] | null;
+    proctorEnabled: boolean;
   }) => void;
   onBack: () => void;
 }
@@ -84,6 +87,7 @@ function SystemCheckStep({ onNext, onBack }: { onNext: () => void; onBack: () =>
     { label: 'Screen Resolution', status: 'pending' },
     { label: 'Webcam Available', status: 'pending' },
     { label: 'Microphone Available', status: 'pending' },
+    { label: 'Single Monitor', status: 'pending' },
   ]);
   const [done, setDone] = useState(false);
   const ran = useRef(false);
@@ -96,20 +100,17 @@ function SystemCheckStep({ onNext, onBack }: { onNext: () => void; onBack: () =>
       setChecks(prev => prev.map((c, i) => i === idx ? { ...c, ...patch } : c));
 
     const run = async () => {
-      // Browser check
       update(0, { status: 'checking' });
       await new Promise(r => setTimeout(r, 600));
       const hasMedia = !!navigator.mediaDevices?.getUserMedia;
       update(0, { status: hasMedia ? 'pass' : 'fail', detail: hasMedia ? 'MediaDevices API supported' : 'Browser does not support required APIs' });
 
-      // Resolution
       update(1, { status: 'checking' });
       await new Promise(r => setTimeout(r, 400));
       const w = window.screen.width, h = window.screen.height;
       const resOk = w >= 1024 && h >= 600;
       update(1, { status: resOk ? 'pass' : 'fail', detail: `${w}×${h}${resOk ? '' : ' — minimum 1024×600 required'}` });
 
-      // Webcam
       update(2, { status: 'checking' });
       await new Promise(r => setTimeout(r, 300));
       try {
@@ -118,7 +119,6 @@ function SystemCheckStep({ onNext, onBack }: { onNext: () => void; onBack: () =>
         update(2, { status: hasCam ? 'pass' : 'fail', detail: hasCam ? 'Camera device found' : 'No camera detected' });
       } catch { update(2, { status: 'fail', detail: 'Cannot enumerate devices' }); }
 
-      // Mic
       update(3, { status: 'checking' });
       await new Promise(r => setTimeout(r, 300));
       try {
@@ -126,6 +126,12 @@ function SystemCheckStep({ onNext, onBack }: { onNext: () => void; onBack: () =>
         const hasMic = devices.some(d => d.kind === 'audioinput');
         update(3, { status: hasMic ? 'pass' : 'fail', detail: hasMic ? 'Microphone device found' : 'No microphone detected' });
       } catch { update(3, { status: 'fail', detail: 'Cannot enumerate devices' }); }
+
+      // Monitor check
+      update(4, { status: 'checking' });
+      await new Promise(r => setTimeout(r, 300));
+      const { detected, reason } = detectMultipleMonitors();
+      update(4, { status: detected ? 'fail' : 'pass', detail: detected ? reason : 'Single monitor detected' });
 
       setDone(true);
     };
@@ -230,7 +236,6 @@ function MicCheckStep({ onNext, onBack }: { onNext: () => void; onBack: () => vo
     return () => {
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
       ctxRef.current?.close();
-      // Don't stop mic stream — we pass it forward
     };
   }, []);
 
@@ -238,7 +243,6 @@ function MicCheckStep({ onNext, onBack }: { onNext: () => void; onBack: () => vo
     if (rafRef.current) cancelAnimationFrame(rafRef.current);
     ctxRef.current?.close();
     ctxRef.current = null;
-    // Keep streamRef.current alive — store in sessionStorage-like pattern via window
     (window as any).__proctoredMicStream = streamRef.current;
     onNext();
   };
@@ -334,7 +338,7 @@ function CameraCheckStep({ onNext, onBack }: { onNext: () => void; onBack: () =>
     setStatus('loading');
     setError('');
     try {
-      await getDetector();
+      await getLandmarker();
       const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
       streamRef.current = stream;
       if (videoRef.current) {
@@ -348,16 +352,12 @@ function CameraCheckStep({ onNext, onBack }: { onNext: () => void; onBack: () =>
         if (!videoRef.current) return;
         const res = await detectFaces(videoRef.current);
         if (!res) return;
-        const count = res.detections.length;
+        const count = res.faceLandmarks?.length ?? 0;
         if (count === 1) {
           streak++;
           if (streak >= 3) {
-            // Capture embedding
-            const box = res.detections[0].boundingBox!;
-            embeddingRef.current = extractEmbedding(videoRef.current!, {
-              originX: box.originX, originY: box.originY,
-              width: box.width, height: box.height
-            });
+            // Capture landmark-based embedding
+            embeddingRef.current = extractEmbeddingFromLandmarks(res.faceLandmarks[0]);
             setStatus('face_ok');
           } else {
             setStatus('streaming');
@@ -406,7 +406,6 @@ function CameraCheckStep({ onNext, onBack }: { onNext: () => void; onBack: () =>
         <CardDescription className="text-center">{statusMessage}</CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
-        {/* Video Preview */}
         <div className="relative mx-auto aspect-[4/3] w-full max-w-sm overflow-hidden rounded-xl border-2 border-border bg-muted">
           <video
             ref={videoRef}
@@ -414,13 +413,11 @@ function CameraCheckStep({ onNext, onBack }: { onNext: () => void; onBack: () =>
             playsInline
             className="h-full w-full object-cover [transform:scaleX(-1)]"
           />
-          {/* Oval guide overlay */}
           {(status === 'streaming' || status === 'no_face' || status === 'multiple') && (
             <div className="absolute inset-0 flex items-center justify-center">
               <div className="h-48 w-36 rounded-[50%] border-2 border-dashed border-primary/50" />
             </div>
           )}
-          {/* Status badge */}
           {status === 'face_ok' && (
             <div className="absolute bottom-3 left-1/2 -translate-x-1/2">
               <Badge className="bg-success text-success-foreground">
@@ -477,6 +474,7 @@ function ScreenShareStep({ onBack, onComplete }: {
   onComplete: SetupWizardProps['onComplete'];
 }) {
   const [agreed, setAgreed] = useState(false);
+  const [proctorEnabled, setProctorEnabled] = useState(true);
   const [starting, setStarting] = useState(false);
 
   const rules = [
@@ -510,7 +508,6 @@ function ScreenShareStep({ onBack, onComplete }: {
       const webcamStream = (window as any).__proctoredCamStream as MediaStream | null;
       const embedding = (window as any).__proctoredEmbedding as number[] | null;
 
-      // Clean up window refs
       delete (window as any).__proctoredMicStream;
       delete (window as any).__proctoredCamStream;
       delete (window as any).__proctoredEmbedding;
@@ -526,6 +523,7 @@ function ScreenShareStep({ onBack, onComplete }: {
         micStream,
         screenStream,
         referenceEmbedding: embedding,
+        proctorEnabled,
       });
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Failed to start');
@@ -545,19 +543,37 @@ function ScreenShareStep({ onBack, onComplete }: {
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
-        <div className="grid gap-2">
-          {rules.map(({ icon: Icon, label, desc }) => (
-            <div key={label} className="flex items-start gap-3 rounded-lg border p-3">
-              <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-muted">
-                <Icon className="h-4 w-4 text-muted-foreground" />
-              </div>
-              <div>
-                <p className="text-sm font-medium text-foreground">{label}</p>
-                <p className="text-xs text-muted-foreground">{desc}</p>
-              </div>
+        {/* Proctor toggle */}
+        <div className="flex items-center justify-between rounded-lg border p-3">
+          <div className="flex items-center gap-3">
+            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-muted">
+              <Globe className="h-4 w-4 text-muted-foreground" />
             </div>
-          ))}
+            <div>
+              <p className="text-sm font-medium text-foreground">Enable Proctoring</p>
+              <p className="text-xs text-muted-foreground">
+                {proctorEnabled ? 'All monitoring features active' : 'Monitoring disabled — exam runs without proctoring'}
+              </p>
+            </div>
+          </div>
+          <Switch checked={proctorEnabled} onCheckedChange={setProctorEnabled} />
         </div>
+
+        {proctorEnabled && (
+          <div className="grid gap-2">
+            {rules.map(({ icon: Icon, label, desc }) => (
+              <div key={label} className="flex items-start gap-3 rounded-lg border p-3">
+                <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-muted">
+                  <Icon className="h-4 w-4 text-muted-foreground" />
+                </div>
+                <div>
+                  <p className="text-sm font-medium text-foreground">{label}</p>
+                  <p className="text-xs text-muted-foreground">{desc}</p>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
 
         <div className="flex items-start gap-3 rounded-lg border border-primary/20 bg-primary/5 p-3">
           <Checkbox
@@ -567,8 +583,10 @@ function ScreenShareStep({ onBack, onComplete }: {
             className="mt-0.5"
           />
           <label htmlFor="agree" className="text-sm text-foreground cursor-pointer">
-            I understand and agree to the proctoring terms. I am aware that my webcam, 
-            microphone, and screen will be monitored throughout the examination.
+            {proctorEnabled
+              ? 'I understand and agree to the proctoring terms. I am aware that my webcam, microphone, and screen will be monitored throughout the examination.'
+              : 'I understand and agree to proceed with the examination without proctoring.'
+            }
           </label>
         </div>
 
