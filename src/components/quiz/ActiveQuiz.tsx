@@ -11,6 +11,7 @@ interface ActiveQuizProps {
   micStream: MediaStream;
   screenStream: MediaStream;
   referenceEmbedding: number[] | null;
+  proctorEnabled: boolean;
   onFinish: (data: {
     answers: Record<number, number>;
     violations: Violation[];
@@ -20,7 +21,7 @@ interface ActiveQuizProps {
   }) => void;
 }
 
-export default function ActiveQuiz({ webcamStream, micStream, screenStream, referenceEmbedding, onFinish }: ActiveQuizProps) {
+export default function ActiveQuiz({ webcamStream, micStream, screenStream, referenceEmbedding, proctorEnabled, onFinish }: ActiveQuizProps) {
   const [answers, setAnswers] = useState<Record<number, number>>({});
   const [currentQ, setCurrentQ] = useState(0);
 
@@ -37,6 +38,7 @@ export default function ActiveQuiz({ webcamStream, micStream, screenStream, refe
       screenStream={screenStream}
       referenceEmbedding={referenceEmbedding}
       durationSeconds={QUIZ_DURATION}
+      proctorEnabled={proctorEnabled}
       examTitle="CS101 Midterm"
       onTimeUp={handleProctorFinish}
       onManualSubmit={handleProctorFinish}

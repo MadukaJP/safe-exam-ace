@@ -10,6 +10,7 @@ interface ExamStreams {
   micStream: MediaStream;
   screenStream: MediaStream;
   referenceEmbedding: number[] | null;
+  proctorEnabled: boolean;
 }
 
 interface ExamResults {
@@ -56,6 +57,7 @@ export default function Index() {
         micStream={streams.micStream}
         screenStream={streams.screenStream}
         referenceEmbedding={streams.referenceEmbedding}
+        proctorEnabled={streams.proctorEnabled}
         onFinish={handleFinish}
       />
     );
